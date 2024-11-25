@@ -1,411 +1,266 @@
 import asyncio
-import websockets
-import http.client
-import json
-import base64
-import ssl
-import os
 import logging
-from pydub import AudioSegment
-import cv2
-import numpy as np
+import os
+import ssl
+import json
+from aiortc import (
+    RTCPeerConnection,
+    RTCSessionDescription,
+    RTCIceCandidate,
+    MediaStreamTrack,
+    RTCConfiguration,
+    RTCIceServer,
+    RTCDataChannel
+)
+from aiortc.contrib.signaling import TcpSocketSignaling
+from aiortc.contrib.media import MediaPlayer, MediaRecorder
+from aiortc.mediastreams import MediaStreamError
 
-# Set up logging configuration
+# Configure logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("LLM-Transceiver-Client")
 
 class Client:
-    def __init__(self):
+    def __init__(self, signaling):
         """
-        Initialize the Client instance variables.
+        Initialize the Client with signaling mechanism and peer connection.
         """
-        self.https_connection = None
-        self.webrtc_connection = None
-        self.is_webrtc_enabled = False
+        self.signaling = signaling
+        self.pc = RTCPeerConnection()
+        self.media_player = None
+        self.media_recorder = None
+        self.data_channel = None
+        self.connected = asyncio.Event()
+        self.lock = asyncio.Lock()
+        self.file_buffer = bytearray()
+        self.receiving_file = False
+        self.received_file_path = 'received_file.bin'  # Default path
 
-    async def connect_to_server(self, url, certfile=None):
-        """
-        Establish a connection to the server using HTTPS or WebRTC.
+        # Set up event handlers
+        self.pc.on("iceconnectionstatechange", self.on_ice_connection_state_change)
+        self.pc.on("datachannel", self.on_datachannel)
+        self.pc.on("track", self.on_track)
 
-        Args:
-            url (str): The server URL.
-            certfile (str, optional): Path to SSL certificate file for secure WebSocket connection.
-        """
-        try:
-            if not self.https_connection and not self.is_webrtc_enabled:
-                self.https_connection = http.client.HTTPSConnection(url)
-                logger.info(f"Connected to {url} using HTTPS")
-            elif not self.is_webrtc_enabled:
-                ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-                if certfile:
-                    ssl_context.load_verify_locations(certfile)
-                self.webrtc_connection = await websockets.connect(f"wss://{url}/", ssl=ssl_context)
-                self.is_webrtc_enabled = True
-                logger.info(f"Connected to {url} using WebRTC")
-        except Exception as e:
-            logger.exception(f"Error connecting to server {url}: {e}")
-            raise
+    async def on_ice_connection_state_change(self):
+        logger.info(f"ICE connection state is {self.pc.iceConnectionState}")
+        if self.pc.iceConnectionState == 'connected':
+            self.connected.set()
+        elif self.pc.iceConnectionState == 'failed':
+            await self.pc.close()
+            self.connected.clear()
 
-    async def send_audio(self, audio_data):
-        """
-        Send audio data to the server.
+    def on_datachannel(self, channel: RTCDataChannel):
+        logger.info(f"Data channel received: {channel.label}")
 
-        Args:
-            audio_data (bytes): Raw audio data.
-        """
-        try:
-            if self.https_connection:
-                headers = {'Content-type': 'application/octet-stream'}
-                self.https_connection.request('POST', '/audio', body=audio_data, headers=headers)
-                response = self.https_connection.getresponse()
-                logger.info(f"Sent audio data over HTTPS, response status: {response.status}")
-                response.read()
-            elif self.webrtc_connection:
-                encoded_audio = base64.b64encode(audio_data).decode('utf-8')
-                message = json.dumps({"type": "audio", "data": encoded_audio})
-                await self.webrtc_connection.send(message)
-                logger.info("Sent audio data over WebRTC")
-        except Exception as e:
-            logger.exception(f"Error sending audio data: {e}")
+        @channel.on("message")
+        def on_message(message):
+            asyncio.create_task(self.handle_datachannel_message(message, channel))
 
-    async def receive_audio(self):
-        """
-        Receive audio data from the server.
+    async def handle_datachannel_message(self, message, channel):
+        if isinstance(message, str):
+            data = json.loads(message)
+            if data.get("type") == "text":
+                logger.info(f"Received text message: {data.get('data')}")
+            elif data.get("type") == "file_start":
+                self.received_file_path = data.get("filename", "received_file.bin")
+                self.file_buffer = bytearray()
+                self.receiving_file = True
+                logger.info(f"Starting file reception: {self.received_file_path}")
+            elif data.get("type") == "file_end":
+                with open(self.received_file_path, 'wb') as f:
+                    f.write(self.file_buffer)
+                self.receiving_file = False
+                logger.info(f"File received and saved to {self.received_file_path}")
+        else:
+            # Binary data (file chunks)
+            if self.receiving_file:
+                self.file_buffer.extend(message)
+                logger.debug(f"Received file chunk of size {len(message)} bytes")
+            else:
+                logger.warning("Received binary data but not in file reception mode")
 
-        Returns:
-            bytes: Received audio data.
-        """
-        try:
-            if self.https_connection:
-                self.https_connection.request('GET', '/audio')
-                response = self.https_connection.getresponse()
-                audio_data = response.read()
-                logger.info("Received audio data over HTTPS")
-                return audio_data
-            elif self.webrtc_connection:
-                while True:
-                    message = await self.webrtc_connection.recv()
-                    data = json.loads(message)
-                    if data.get("type") == "audio":
-                        decoded_audio = base64.b64decode(data.get("data"))
-                        logger.info("Received audio data over WebRTC")
-                        return decoded_audio
-        except Exception as e:
-            logger.exception(f"Error receiving audio data: {e}")
-            return None
+    def on_track(self, track: MediaStreamTrack):
+        logger.info(f"Track received: {track.kind}")
 
-    async def send_video(self, frame):
-        """
-        Send video frame to the server.
+        if track.kind == "audio" or track.kind == "video":
+            if not self.media_recorder:
+                self.media_recorder = MediaRecorder('received_media.mp4')
+            self.media_recorder.addTrack(track)
 
-        Args:
-            frame (numpy.ndarray): Video frame.
+    async def start(self):
         """
-        try:
-            _, encoded_image = cv2.imencode('.jpg', frame)
-            image_bytes = encoded_image.tobytes()
-            if self.https_connection:
-                headers = {'Content-type': 'application/octet-stream'}
-                self.https_connection.request('POST', '/video', body=image_bytes, headers=headers)
-                response = self.https_connection.getresponse()
-                logger.info(f"Sent video data over HTTPS, response status: {response.status}")
-                response.read()
-            elif self.webrtc_connection:
-                encoded_video = base64.b64encode(image_bytes).decode('utf-8')
-                message = json.dumps({"type": "video", "data": encoded_video})
-                await self.webrtc_connection.send(message)
-                logger.info("Sent video data over WebRTC")
-        except Exception as e:
-            logger.exception(f"Error sending video data: {e}")
-
-    async def receive_video(self):
+        Start the client: establish connection and handle media.
         """
-        Receive video frame from the server.
+        await self.exchange_signaling()
 
-        Returns:
-            numpy.ndarray: Received video frame.
+        # Wait for connection to be established
+        await self.connected.wait()
+
+        # Set up media
+        await self.setup_media()
+
+    async def exchange_signaling(self):
         """
-        try:
-            if self.https_connection:
-                self.https_connection.request('GET', '/video')
-                response = self.https_connection.getresponse()
-                video_data = response.read()
-                nparr = np.frombuffer(video_data, np.uint8)
-                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                logger.info("Received video data over HTTPS")
-                return frame
-            elif self.webrtc_connection:
-                while True:
-                    message = await self.webrtc_connection.recv()
-                    data = json.loads(message)
-                    if data.get("type") == "video":
-                        decoded_video = base64.b64decode(data.get("data"))
-                        nparr = np.frombuffer(decoded_video, np.uint8)
-                        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                        logger.info("Received video data over WebRTC")
-                        return frame
-        except Exception as e:
-            logger.exception(f"Error receiving video data: {e}")
-            return None
-
-    async def send_text(self, text):
+        Exchange SDP and ICE candidates with the server.
         """
-        Send text message to the server.
+        await self.signaling.connect()
 
-        Args:
-            text (str): Text message to send.
+        # Create data channel
+        self.data_channel = self.pc.createDataChannel('chat')
+        self.data_channel.on("open", self.on_datachannel_open)
+        self.data_channel.on("message", lambda message: asyncio.create_task(self.handle_datachannel_message(message, self.data_channel)))
+
+        # Add local media tracks
+        await self.add_local_tracks()
+
+        # Create offer and set local description
+        offer = await self.pc.createOffer()
+        await self.pc.setLocalDescription(offer)
+
+        # Send offer to the server
+        await self.signaling.send(json.dumps({
+            'sdp': self.pc.localDescription.sdp,
+            'type': self.pc.localDescription.type
+        }))
+
+        # Wait for the answer
+        response = await self.signaling.receive()
+        answer = json.loads(response)
+        await self.pc.setRemoteDescription(RTCSessionDescription(
+            sdp=answer['sdp'],
+            type=answer['type']
+        ))
+
+        # Exchange ICE candidates
+        asyncio.create_task(self.exchange_ice_candidates())
+
+    async def exchange_ice_candidates(self):
         """
-        try:
-            if self.https_connection:
-                headers = {'Content-type': 'application/json'}
-                body = json.dumps({"text": text})
-                self.https_connection.request('POST', '/text', body=body, headers=headers)
-                response = self.https_connection.getresponse()
-                logger.info(f"Sent text data over HTTPS, response status: {response.status}")
-                response.read()
-            elif self.webrtc_connection:
-                message = json.dumps({"type": "text", "data": text})
-                await self.webrtc_connection.send(message)
-                logger.info("Sent text data over WebRTC")
-        except Exception as e:
-            logger.exception(f"Error sending text data: {e}")
-
-    async def receive_text(self):
+        Exchange ICE candidates with the server.
         """
-        Receive text message from the server.
+        async def send_ice_candidates():
+            while True:
+                candidate = await self.pc.sctp.transport.getRemoteCandidate()
+                if candidate is None:
+                    break
+                await self.signaling.send(json.dumps({
+                    'candidate': candidate.to_sdp(),
+                    'sdpMid': candidate.sdpMid,
+                    'sdpMLineIndex': candidate.sdpMLineIndex
+                }))
 
-        Returns:
-            str: Received text message.
+        asyncio.create_task(send_ice_candidates())
+
+        while True:
+            message = await self.signaling.receive()
+            if message is None:
+                break
+            data = json.loads(message)
+            candidate = RTCIceCandidate(
+                sdpMid=data['sdpMid'],
+                sdpMLineIndex=data['sdpMLineIndex'],
+                candidate=data['candidate']
+            )
+            await self.pc.addIceCandidate(candidate)
+
+    async def add_local_tracks(self):
         """
-        try:
-            if self.https_connection:
-                self.https_connection.request('GET', '/text')
-                response = self.https_connection.getresponse()
-                data = json.loads(response.read())
-                text = data.get("text")
-                logger.info("Received text data over HTTPS")
-                return text
-            elif self.webrtc_connection:
-                while True:
-                    message = await self.webrtc_connection.recv()
-                    data = json.loads(message)
-                    if data.get("type") == "text":
-                        text = data.get("data")
-                        logger.info("Received text data over WebRTC")
-                        return text
-        except Exception as e:
-            logger.exception(f"Error receiving text data: {e}")
-            return None
-
-    async def send_image(self, image_path):
+        Add local media tracks from camera and microphone.
         """
-        Send image to the server.
+        options = {'framerate': '30', 'video_size': '640x480'}
+        self.media_player = MediaPlayer('/dev/video0', format='v4l2', options=options)
 
-        Args:
-            image_path (str): Path to the image file.
+        if self.media_player.audio:
+            self.pc.addTrack(self.media_player.audio)
+        if self.media_player.video:
+            self.pc.addTrack(self.media_player.video)
+
+    async def setup_media(self):
         """
-        try:
-            with open(image_path, 'rb') as img_file:
-                image_data = img_file.read()
-            if self.https_connection:
-                headers = {'Content-type': 'application/octet-stream'}
-                self.https_connection.request('POST', '/image', body=image_data, headers=headers)
-                response = self.https_connection.getresponse()
-                logger.info(f"Sent image data over HTTPS, response status: {response.status}")
-                response.read()
-            elif self.webrtc_connection:
-                encoded_image = base64.b64encode(image_data).decode('utf-8')
-                message = json.dumps({"type": "image", "data": encoded_image})
-                await self.webrtc_connection.send(message)
-                logger.info("Sent image data over WebRTC")
-        except Exception as e:
-            logger.exception(f"Error sending image data: {e}")
-
-    async def receive_image(self, save_path):
+        Set up media recording.
         """
-        Receive image from the server and save it.
+        if self.media_recorder:
+            await self.media_recorder.start()
 
-        Args:
-            save_path (str): Path where to save the received image.
+    async def on_datachannel_open(self):
+        logger.info("Data channel is open")
 
-        Returns:
-            str: Path to the saved image file.
+    async def send_text(self, message):
         """
-        try:
-            if self.https_connection:
-                self.https_connection.request('GET', '/image')
-                response = self.https_connection.getresponse()
-                image_data = response.read()
-                with open(save_path, 'wb') as img_file:
-                    img_file.write(image_data)
-                logger.info("Received image data over HTTPS")
-                return save_path
-            elif self.webrtc_connection:
-                while True:
-                    message = await self.webrtc_connection.recv()
-                    data = json.loads(message)
-                    if data.get("type") == "image":
-                        image_data = base64.b64decode(data.get("data"))
-                        with open(save_path, 'wb') as img_file:
-                            img_file.write(image_data)
-                        logger.info("Received image data over WebRTC")
-                        return save_path
-        except Exception as e:
-            logger.exception(f"Error receiving image data: {e}")
-            return None
+        Send a text message over the data channel.
+        """
+        async with self.lock:
+            if self.data_channel and self.data_channel.readyState == 'open':
+                data = json.dumps({"type": "text", "data": message})
+                self.data_channel.send(data)
+                logger.info(f"Sent text message: {message}")
+            else:
+                logger.warning("Data channel is not open")
 
     async def send_file(self, file_path):
         """
-        Send a file to the server.
-
-        Args:
-            file_path (str): Path to the file to send.
+        Send a file over the data channel.
         """
-        try:
-            with open(file_path, 'rb') as file:
-                file_data = file.read()
-            filename = os.path.basename(file_path)
-            if self.https_connection:
-                headers = {'Content-type': 'application/octet-stream', 'Filename': filename}
-                self.https_connection.request('POST', '/file', body=file_data, headers=headers)
-                response = self.https_connection.getresponse()
-                logger.info(f"Sent file data over HTTPS, response status: {response.status}")
-                response.read()
-            elif self.webrtc_connection:
-                encoded_file = base64.b64encode(file_data).decode('utf-8')
-                message = json.dumps({"type": "file", "filename": filename, "data": encoded_file})
-                await self.webrtc_connection.send(message)
-                logger.info("Sent file data over WebRTC")
-        except Exception as e:
-            logger.exception(f"Error sending file data: {e}")
+        async with self.lock:
+            if self.data_channel and self.data_channel.readyState == 'open':
+                filename = os.path.basename(file_path)
+                # Notify server of incoming file
+                start_message = json.dumps({"type": "file_start", "filename": filename})
+                self.data_channel.send(start_message)
 
-    async def receive_file(self, save_directory):
-        """
-        Receive a file from the server and save it.
+                # Send file data in chunks
+                with open(file_path, 'rb') as f:
+                    while True:
+                        chunk = f.read(16384)
+                        if not chunk:
+                            break
+                        self.data_channel.send(chunk)
+                        await asyncio.sleep(0)  # Yield control to event loop
 
-        Args:
-            save_directory (str): Directory where to save the received file.
-
-        Returns:
-            str: Path to the saved file.
-        """
-        try:
-            if self.https_connection:
-                self.https_connection.request('GET', '/file')
-                response = self.https_connection.getresponse()
-                headers = dict(response.getheaders())
-                filename = headers.get('Filename', 'received_file')
-                file_data = response.read()
-                save_path = os.path.join(save_directory, filename)
-                with open(save_path, 'wb') as file:
-                    file.write(file_data)
-                logger.info(f"Received file data over HTTPS, saved to {save_path}")
-                return save_path
-            elif self.webrtc_connection:
-                while True:
-                    message = await self.webrtc_connection.recv()
-                    data = json.loads(message)
-                    if data.get("type") == "file":
-                        file_data = base64.b64decode(data.get("data"))
-                        filename = data.get("filename", "received_file")
-                        save_path = os.path.join(save_directory, filename)
-                        with open(save_path, 'wb') as file:
-                            file.write(file_data)
-                        logger.info(f"Received file data over WebRTC, saved to {save_path}")
-                        return save_path
-        except Exception as e:
-            logger.exception(f"Error receiving file data: {e}")
-            return None
-
-    def toggle_protocol(self):
-        """
-        Toggle between HTTPS and WebRTC protocols.
-        """
-        try:
-            if self.https_connection:
-                self.https_connection.close()
-                self.https_connection = None
-                self.is_webrtc_enabled = True
-                logger.info("Switched to WebRTC protocol")
+                # Notify server that file transmission is complete
+                end_message = json.dumps({"type": "file_end"})
+                self.data_channel.send(end_message)
+                logger.info(f"Sent file: {file_path}")
             else:
-                if self.webrtc_connection:
-                    asyncio.run(self.webrtc_connection.close())
-                    self.webrtc_connection = None
-                self.is_webrtc_enabled = False
-                logger.info("Switched to HTTPS protocol")
-        except Exception as e:
-            logger.exception(f"Error toggling protocol: {e}")
+                logger.warning("Data channel is not open")
 
-    async def start_listening(self, url, certfile=None):
+    async def stop(self):
         """
-        Start the communication loop with the server.
-
-        Args:
-            url (str): Server URL.
-            certfile (str, optional): Path to SSL certificate file for secure WebSocket connection.
+        Stop media processing and close the connection.
         """
-        await self.connect_to_server(url, certfile=certfile)
-        logger.info("Starting communication loop...")
-        try:
-            while True:
-                # Example send/receive operations
-                # Replace placeholder data with actual data handling
-
-                # Send and receive text
-                await self.send_text("Hello, server!")
-                received_text = await self.receive_text()
-                if received_text:
-                    logger.info(f"Received text: {received_text}")
-
-                # Send and receive audio
-                # Replace with actual audio data
-                audio_data = b'...'  # Placeholder for audio data
-                await self.send_audio(audio_data)
-                received_audio = await self.receive_audio()
-                if received_audio:
-                    # Process received audio data
-                    pass  # Replace with actual processing
-
-                # Send and receive video
-                # Replace with actual video frame
-                frame = np.zeros((480, 640, 3), dtype=np.uint8)  # Placeholder frame
-                await self.send_video(frame)
-                received_frame = await self.receive_video()
-                if received_frame is not None:
-                    # Process received video frame
-                    pass  # Replace with actual processing
-
-                # Send and receive image
-                image_path = 'path_to_image.jpg'  # Replace with actual image path
-                await self.send_image(image_path)
-                received_image_path = await self.receive_image('received_image.jpg')
-                if received_image_path:
-                    # Process received image
-                    pass  # Replace with actual processing
-
-                # Send and receive file
-                file_path = 'path_to_file.txt'  # Replace with actual file path
-                await self.send_file(file_path)
-                received_file_path = await self.receive_file('.')
-                if received_file_path:
-                    # Process received file
-                    pass  # Replace with actual processing
-
-                # Wait before next iteration
-                await asyncio.sleep(1)
-        except Exception as e:
-            logger.exception(f"Error in communication loop: {e}")
-        finally:
-            # Clean up connections
-            if self.https_connection:
-                self.https_connection.close()
-            if self.webrtc_connection:
-                await self.webrtc_connection.close()
-            logger.info("Communication loop has ended")
+        if self.media_recorder:
+            await self.media_recorder.stop()
+        if self.media_player:
+            await self.media_player.stop()
+        if self.pc:
+            await self.pc.close()
+        if self.signaling:
+            await self.signaling.close()
+        logger.info("Client has been stopped")
 
 # Entry point
+async def run_client():
+    signaling = TcpSocketSignaling('localhost', 1234)
+    client = Client(signaling)
+
+    try:
+        await client.start()
+
+        # Example: Send a text message
+        await client.send_text("Hello, server!")
+
+        # Example: Send a file
+        await client.send_file('path_to_file.txt')
+
+        # Keep the client running until interrupted
+        while True:
+            await asyncio.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Client interrupted by user")
+    except Exception as e:
+        logger.exception(f"An error occurred: {e}")
+    finally:
+        await client.stop()
+
 if __name__ == '__main__':
-    client = Client()
-    # Replace 'example.com' with the actual server URL
-    # If SSL certificate is needed for WebSocket, provide the path to the certfile
-    asyncio.run(client.start_listening("example.com", certfile='path_to_certfile'))
+    asyncio.run(run_client())
