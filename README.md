@@ -8,12 +8,12 @@ The repository contains both client and server Python code that establishes WebR
 
 ## Features
 
-True WebRTC Functionality: Utilizes the aiortc library to establish real WebRTC connections.
-Bidirectional Communication: Supports sending and receiving text messages, files, and media streams (audio and video).
-Data Channels: Employs data channels for efficient and reliable data transfer.
-Media Streams: Manages media tracks for audio and video communication.
-Thread Safety: Implements thread safety using asyncio.Lock.
-LLM Integration Placeholders: Includes placeholders for integrating with an LLM of your choice.
+- True WebRTC Functionality: Utilizes the aiortc library to establish real WebRTC connections.
+- Bidirectional Communication: Supports sending and receiving text messages, files, and media streams (audio and video).
+- Data Channels: Employs data channels for efficient and reliable data transfer.
+- Media Streams: Manages media tracks for audio and video communication.
+- Thread Safety: Implements thread safety using asyncio.Lock.
+- LLM Integration Placeholders: Includes placeholders for integrating with an LLM of your choice.
 
 ## Requirements
 
