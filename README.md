@@ -17,12 +17,12 @@ The repository contains both client and server Python code that establishes WebR
 
 ## Requirements
 
-Python 3.7 or higher
-`aiortc` library
-`opencv-python` (for video handling)
-`numpy`
-`asyncio`
-Other dependencies as specified in requirements.txt
+- Python 3.7 or higher
+- `aiortc` library
+- `opencv-python` (for video handling)
+- `numpy`
+- `asyncio`
+- Other dependencies as specified in requirements.txt
 
 ## Installation
 
